@@ -23,6 +23,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from typing import Union, List, Any, Dict, Optional, Collection
 from pathlib import Path
+import pytesseract
 
 import numpy as np
 import torch
@@ -31,7 +32,7 @@ from cnstd.consts import AVAILABLE_MODELS as DET_AVAILABLE_MODELS
 from cnstd import CnStd
 from cnstd.utils import data_dir as det_data_dir
 
-from .consts import AVAILABLE_MODELS as REC_AVAILABLE_MODELS, VOCAB_FP
+from .consts import AVAILABLE_MODELS as REC_AVAILABLE_MODELS
 from .utils import data_dir, read_img
 from .line_split import line_split
 from .recognizer import Recognizer
@@ -62,14 +63,14 @@ class OcrResult(object):
 class CnOcr(object):
     def __init__(
         self,
-        rec_model_name: str = 'densenet_lite_136-fc',
+        rec_model_name: str = 'densenet_lite_136-gru',
         *,
         det_model_name: str = 'ch_PP-OCRv3_det',
         cand_alphabet: Optional[Union[Collection, str]] = None,
         context: str = 'cpu',  # ['cpu', 'gpu', 'cuda']
         rec_model_fp: Optional[str] = None,
         rec_model_backend: str = 'onnx',  # ['pytorch', 'onnx']
-        rec_vocab_fp: Union[str, Path] = VOCAB_FP,
+        rec_vocab_fp: Optional[Union[str, Path]] = None,
         rec_more_configs: Optional[Dict[str, Any]] = None,
         rec_root: Union[str, Path] = data_dir(),
         det_model_fp: Optional[str] = None,
@@ -82,7 +83,7 @@ class CnOcr(object):
         识别模型初始化函数。
 
         Args:
-            rec_model_name (str): 识别模型名称。默认为 `densenet_lite_136-fc`
+            rec_model_name (str): 识别模型名称。默认为 `densenet_lite_136-gru`
             det_model_name (str): 检测模型名称。默认为 `ch_PP-OCRv3_det`
             cand_alphabet (Optional[Union[Collection, str]]): 待识别字符所在的候选集合。默认为 `None`，表示不限定识别字符范围
             context (str): 'cpu', or 'gpu'。表明预测时是使用CPU还是GPU。默认为 `cpu`。
@@ -90,11 +91,11 @@ class CnOcr(object):
             rec_model_fp (Optional[str]): 如果不使用系统自带的识别模型，可以通过此参数直接指定所使用的模型文件（'.ckpt' 文件）
             rec_model_backend (str): 'pytorch', or 'onnx'。表明识别时是使用 PyTorch 版本模型，还是使用 ONNX 版本模型。
                 同样的模型，ONNX 版本的预测速度一般是 PyTorch 版本的2倍左右。默认为 'onnx'。
-            rec_vocab_fp (Union[str, Path]): 识别字符集合的文件路径，即 `label_cn.txt` 文件路径。
+            rec_vocab_fp (Optional[Union[str, Path]]): 识别字符集合的文件路径，即 `label_cn.txt` 文件路径。取值为 `None` 表示使用系统设定的词表。
                 若训练的自有模型更改了字符集，看通过此参数传入新的字符集文件路径。
             rec_more_configs (Optional[Dict[str, Any]]): 识别模型初始化时传入的其他参数。
             rec_root (Union[str, Path]): 识别模型文件所在的根目录。
-                Linux/Mac下默认值为 `~/.cnocr`，表示模型文件所处文件夹类似 `~/.cnocr/2.2/densenet_lite_136-fc`。
+                Linux/Mac下默认值为 `~/.cnocr`，表示模型文件所处文件夹类似 `~/.cnocr/2.3/densenet_lite_136-gru`。
                 Windows下默认值为 `C:/Users/<username>/AppData/Roaming/cnocr`。
             det_model_fp (Optional[str]): 如果不使用系统自带的检测模型，可以通过此参数直接指定所使用的模型文件（'.ckpt' 文件）
             det_model_backend (str): 'pytorch', or 'onnx'。表明检测时是使用 PyTorch 版本模型，还是使用 ONNX 版本模型。
@@ -110,13 +111,13 @@ class CnOcr(object):
             >>> ocr = CnOcr()
 
             使用指定模型：
-            >>> ocr = CnOcr('densenet_lite_136-fc')
+            >>> ocr = CnOcr('densenet_lite_136-gru')
 
             识别时只考虑数字：
-            >>> ocr = CnOcr(rec_model_name='densenet_lite_136-fc', det_model_name='naive_det', cand_alphabet='0123456789')
+            >>> ocr = CnOcr(rec_model_name='densenet_lite_136-gru', det_model_name='naive_det', cand_alphabet='0123456789')
 
             只检测和识别水平文字：
-            >>> ocr = CnOcr(rec_model_name='densenet_lite_136-fc', det_model_name='db_shufflenet_v2_small', det_more_configs={'rotated_bbox': False})
+            >>> ocr = CnOcr(rec_model_name='densenet_lite_136-gru', det_model_name='db_shufflenet_v2_small', det_more_configs={'rotated_bbox': False})
 
         """
         if kwargs.get('model_name') is not None and rec_model_name is None:
@@ -144,7 +145,7 @@ class CnOcr(object):
             rec_cls = Recognizer
         elif self.rec_space == PP_SPACE:
             rec_cls = PPRecognizer
-            if rec_vocab_fp is not None and rec_vocab_fp != VOCAB_FP:
+            if rec_vocab_fp is not None:
                 logger.warning('param `vocab_fp` is invalid for %s models' % PP_SPACE)
         else:
             raise NotImplementedError(
@@ -154,6 +155,7 @@ class CnOcr(object):
         rec_more_configs = rec_more_configs or dict()
         self.rec_model = rec_cls(
             model_name=rec_model_name,
+            model_backend=rec_model_backend,
             cand_alphabet=cand_alphabet,
             context=context,
             model_fp=rec_model_fp,
@@ -402,3 +404,23 @@ class CnOcr(object):
             results.append(_out.to_dict())
 
         return results
+
+    # Ensure you have Tesseract installed and pytesseract configured correctly.
+    # Example path setup for Windows:
+    # pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+
+    def ocr_with_coordinates(image_path):
+        # Open the image
+        image = Image.open(image_path)
+
+        # Use pytesseract to get detailed OCR results
+        ocr_data = pytesseract.image_to_boxes(image)
+
+        # Print and return the detailed results with positions
+        for line in ocr_data.splitlines():
+            char, x1, y1, x2, y2, _ = line.split()
+            print(f"Character: {char}, Coordinates: ({x1}, {y1}), ({x2}, {y2})")
+
+        return ocr_data
+
+
